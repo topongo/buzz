@@ -1,0 +1,636 @@
+use std::{collections::HashMap, fmt::Display, fs::read_to_string, io::ErrorKind, path::PathBuf, sync::Arc, time::Duration};
+use serde_json::{Number, Value};
+use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter}, net::{UnixListener, UnixStream}, signal::unix::{signal, SignalKind}, sync::{broadcast, Mutex}};
+
+use log::{debug, error, info, warn};
+
+use clap::{Parser};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize, Serialize, Debug)]
+enum Expression {
+    Variable(String),
+    Static(Value),
+    Not(Box<Expression>),
+    And(Box<Expression>, Box<Expression>),
+    Or(Box<Expression>, Box<Expression>),
+    Equals(Box<Expression>, Box<Expression>),
+}
+
+impl Expression {
+    #[allow(dead_code)]
+    fn get_listeners(&self) -> Vec<String> {
+        match self {
+            Expression::And(left, right) |
+            Expression::Equals(left, right) |
+            Expression::Or(left, right) => left.get_listeners()
+                .into_iter()
+                .chain(right.get_listeners())
+                .collect(),
+            Expression::Not(expr) => expr.get_listeners(),
+            Expression::Static(_) => vec![],
+            Expression::Variable(var) => vec![var.clone()],
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Debug)]
+enum Reaction {
+    Command(Vec<String>),
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Debug)]
+struct Listener {
+    /// The socket path to send updates to
+    condition: Expression,
+    /// Wherer to fire the event on every set or only on change
+    #[serde(default)]
+    sensible: bool,
+    /// Reaction to perform on condition true
+    #[serde(default)]
+    operation: Option<Reaction>,
+    /// Reaction to perform on condition false
+    #[serde(default)]
+    operation_false: Option<Reaction>,
+}
+
+fn default_socket_path() -> PathBuf { PathBuf::from("config.toml") }
+
+#[derive(Deserialize, Debug)]
+struct Config {
+    #[serde(default = "default_socket_path")]
+    socket_path: PathBuf,
+    #[allow(dead_code)]
+    listeners: Option<Vec<Listener>>,
+}
+
+#[derive(Parser, Debug)]
+struct Command {
+    #[arg(long, short)]
+    config: Option<PathBuf>,
+    #[command(subcommand)]
+    subcomm: Subcommand,
+}
+
+#[derive(Debug,clap::Subcommand)]
+enum Subcommand {
+    Listen {
+    },
+    Send {
+        #[clap(trailing_var_arg=true)]
+        data: Vec<String>,
+    }
+}
+
+#[derive(Default)]
+struct Storage {
+    data: HashMap<String, Value>,
+    listeners: HashMap<String, broadcast::Sender<Value>>,
+}
+
+impl Storage {
+    fn insert(&mut self, key: String, value: Value) {
+        let prev = self.data.get(&key).cloned().unwrap_or(Value::Null);
+        self.data.insert(key.clone(), value.clone());
+        self.listeners
+            .get(&key)
+            .map(|tx| {
+                debug!("notifying listeners for key '{}'", key);
+                if prev != value {
+                    if tx.send(value.clone()).is_err() {
+                        error!("failed to send value to listeners for key '{}'", key);
+                    }
+                }
+            });
+    }
+
+    fn get(&self, key: &str) -> &Value {
+        self.data.get(key).unwrap_or(&Value::Null)
+    }
+
+    #[allow(dead_code)]
+    fn remove(&mut self, key: &str) {
+        self.data.remove(key);
+    }
+
+    async fn listen(&mut self, key: String) -> broadcast::Receiver<Value> {
+        if self.listeners.contains_key(&key) {
+            debug!("listener for key '{}' already exists, using that", key);
+            self.listeners.get(&key).unwrap().subscribe()
+        } else {
+            debug!("creating new listener for key '{}'", key);
+            let (tx, rx) = tokio::sync::broadcast::channel(100);
+            self.listeners.insert(key.clone(), tx);
+            rx
+        }
+    }
+
+    #[allow(dead_code)]
+    fn unsubscribe(&mut self, key: &str) {
+        let list = self.listeners.get(key).unwrap();
+        info!("current subscribers for value {key}: {}", list.receiver_count());
+
+        self.listeners.remove(key);
+    }
+
+    // fn eval(&self, expr: &Expression) -> bool {
+    //     match expr {
+    //         Expression::Equals(left, right) => {
+    //             let left_value = self.eval(left);
+    //             let right_value = self.eval(right);
+    //         }
+    //     }
+    // }
+}
+
+#[derive(Clone,Copy)]
+enum Operation {
+    // Add,
+    // Subtract,
+    // Multiply,
+    // Divide,
+    Or,
+    And,
+}
+
+impl Operation {
+    fn parse(op: &str) -> Option<Self> {
+        Some(match op {
+            // "+" => Operation::Add,
+            // "-" => Operation::Subtract,
+            // "*" => Operation::Multiply,
+            // "/" => Operation::Divide,
+            "or" => Operation::Or,
+            "and" => Operation::And,
+            _ => return None,
+        })
+    }
+
+    fn apply(self, op1: Value, op2: Value) -> Value {
+        let op1 = match op1 {
+            Value::Number(n) => Value::Number(n),
+            Value::Bool(b) => Value::Number(Number::from_f64(if b { 1.0 } else { 0.0 }).unwrap()),
+            _ => Value::Null,
+        };
+        let op2 = match op2 {
+            Value::Number(n) => Value::Number(n),
+            Value::Bool(b) => Value::Number(Number::from_f64(if b { 1.0 } else { 0.0 }).unwrap()),
+            _ => Value::Null,
+        };
+
+        match self {
+            Operation::And => {
+                if let (Value::Number(n1), Value::Number(n2)) = (op1, op2) {
+                    Value::Bool(n1.as_f64().unwrap_or(0.0) != 0.0 && n2.as_f64().unwrap_or(0.0) != 0.0)
+                } else {
+                    Value::Null
+                }
+            }
+            Operation::Or => {
+                match (op1, op2) {
+                    (Value::Number(n1), _) if n1.as_f64().unwrap_or(0.0) != 0.0 => Value::Bool(true),
+                    (_, Value::Number(n2)) if n2.as_f64().unwrap_or(0.0) != 0.0 => Value::Bool(true),
+                    _ => Value::Bool(false),
+                }
+            }
+        }
+    }
+}
+
+impl Display for Operation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Operation::Add => write!(f, "+"),
+            // Operation::Subtract => write!(f, "-"),
+            // Operation::Multiply => write!(f, "*"),
+            // Operation::Divide => write!(f, "/"),
+            Operation::Or => write!(f, "or"),
+            Operation::And => write!(f, "and"),
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    pretty_env_logger::init();
+
+
+    // let expr = Expression::And(
+    //     Box::new(Expression::Variable("a".to_string())),
+    //     Box::new(Expression::Or(
+    //         Box::new(Expression::Variable("b".to_string())),
+    //         Box::new(Expression::Static(Value::Bool(true))),
+    //     ))
+    // );
+
+    let comm = Command::parse();
+
+    let config: Config = {
+        let p = comm.config.unwrap_or(PathBuf::from(directories::BaseDirs::new().unwrap().config_dir()).join("buzz/config.toml"));
+        if !p.exists() {
+            error!("config: no such file or directory: {}", p.display());
+            return
+        }
+
+        // read to string
+        let raw = read_to_string(&p).expect("error while reading config file");
+        match toml::from_str(&raw) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("error parsing config file: {}: {e}", p.display());
+                return
+            }
+        }
+    };
+
+    match comm.subcomm {
+        Subcommand::Listen {} => listen(config).await,
+        Subcommand::Send { data } => send(config, data).await,
+    }
+}
+
+async fn listen(config: Config) {
+    let Config { socket_path, .. } = config;
+
+    let (tx_s, mut rx_s) = broadcast::channel(100);
+    tokio::spawn(signal_handler(tx_s));
+
+    info!("opening socket {}...", socket_path.display());
+    let sock = match UnixListener::bind(&socket_path) {
+        Ok(sock) => {
+            info!("socket opened successfully");
+            sock
+        }
+        Err(e) => match e.kind() {
+            ErrorKind::AddrInUse => {
+                info!("socket already exists, trying to remove it...");
+                if std::fs::remove_file(&socket_path).is_ok() {
+                    info!("socket removed successfully, trying to bind again...");
+                    match UnixListener::bind(&socket_path) {
+                        Ok(sock) => {
+                            info!("socket opened successfully after removal");
+                            sock
+                        }
+                        Err(e) => {
+                            error!("failed to open socket after removal: {}", e);
+                            return;
+                        }
+                    }
+                } else {
+                    error!("failed to remove existing socket");
+                    return;
+                }
+            }
+            _ => {
+                error!("failed to open socket: {}", e);
+                return;
+            }
+        }
+    };
+
+    let conn_count = Mutex::new(0);
+
+    let storage = Arc::new(Mutex::new(Storage::default()));
+
+    async fn conn_increment(count: &Mutex<u16>) -> u16 {
+        let mut lock = count.lock().await;
+        let v = *lock;
+        *lock += 1;
+        v
+    }
+
+    loop {
+        tokio::select! {
+            res = sock.accept() => match res {
+                Ok((stream, _addr)) => {
+                    debug!("new connection established, spawning new task");
+
+                    let id = conn_increment(&conn_count).await;
+                    let s = storage.clone();
+                    // subscribe to signal handler
+                    let sb = rx_s.resubscribe();
+
+                    tokio::spawn(handler(id, stream, s, sb));
+                }
+                Err(e) => error!("error accepting connection: {}", e),
+            },
+            _ = rx_s.recv() => {
+                // "graceful" shutdown
+                warn!("received interrupt, gracefully shutdown");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                return;
+            }
+        }
+    }
+}
+
+async fn handler(id: u16, mut stream: tokio::net::UnixStream, data: Arc<Mutex<Storage>>, mut signaling: broadcast::Receiver<()>) {
+    debug!("handler started for connection {}", id);
+    let mut output = BufWriter::new(Vec::new());
+    let mut buffer = [0; 1 << 10];
+    loop {
+        match stream.read(&mut buffer).await {
+            Ok(0) => {
+                info!("connection {} closed by peer", id);
+                break;
+            }
+            Ok(n) => {
+                debug!("connection {} read {} bytes: {:2x?}", id, n, &buffer[..n]);
+                if let Err(e) = output.write_all(&buffer[..n]).await {
+                    error!("error writing to output for connection {}: {}", id, e);
+                    return;
+                }
+                break;
+            }
+            Err(e) => {
+                error!("error reading from stream for connection {}: {}", id, e);
+                break;
+            }
+        }
+    }
+
+    output.flush().await.expect("failed to flush output");
+
+    let output = output.into_inner();
+    debug!("connection {} output length: {}", id, output.len());
+
+    let output = match String::from_utf8(output) {
+        Ok(output) => {
+            output.trim().to_string()
+        }
+        Err(e) => {
+            error!("error converting output to string for connection {}: {}", id, e);
+            return;
+        }
+    };
+
+    info!("connection {} received command: {}", id, output);
+
+    let args = output.split('\0').collect::<Vec<_>>();
+    if args.is_empty() {
+        error!("no command received from connection {}", id);
+        return;
+    }
+
+    match args[0] {
+        "set" => {
+            if args.len() < 3 {
+                error!("set command requires at least 2 arguments, received {}", args.len() - 1);
+                return;
+            }
+            let key = args[1];
+            let value = args[2];
+            let mut storage = data.lock().await;
+            let des: Value = match serde_json::from_str(value) {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("error parsing value '{}' for key '{}' in connection {}: {}", value, key, id, e);
+                    return;
+                }
+            };
+            storage.insert(key.to_string(), des);
+            info!("set command resolved: {key} => {value}");
+        }
+        "get" => {
+            if args.len() < 2 {
+                error!("get command requires at least 1 argument, received {}", args.len() - 1);
+                return;
+            }
+
+            let key = args[1];
+            let storage = data.lock().await;
+            let value = storage.get(key);
+            let serialized = serde_json::to_string(&value).unwrap();
+            if let Err(e) = stream.write_all(serialized.as_bytes()).await {
+                error!("error writing response for connection {}: {}", id, e);
+            }
+            info!("get command resolved: {serialized}");
+        }
+        "listen" => {
+            if args.len() < 2 {
+                error!("listen command requires at least 1 argument, received {}", args.len() - 1);
+                return;
+            }
+
+            let key = args[1];
+
+            let mut storage = data.lock().await;
+            let mut rx = if key == "$" {
+                debug!("requested expression listener");
+                if args.len() < 5 {
+                    error!("listen command with '$' requires at least 4 arguments, received {}", args.len() - 1);
+                    return;
+                } else {
+                    let op1 = args[2];
+                    let operation = match Operation::parse(args[3]) {
+                        Some(op) => op,
+                        None => {
+                            error!("unknown operation '{}' in connection {}", args[3], id);
+                            return;
+                        }
+                    };
+                    let op2 = args[4];
+
+                    let mut v1 = storage.get(op1).clone();
+                    let mut v2 = storage.get(op2).clone();
+                    let mut rx1 = storage.listen(op1.to_string()).await;
+                    let mut rx2 = storage.listen(op2.to_string()).await;
+
+                    let (tx, rx) = broadcast::channel::<Value>(100);
+                    tokio::spawn(async move {
+                        // send initial value
+                        let initial = operation.clone().apply(v1.clone(), v2.clone());
+                        debug!("sending initial value: {initial}");
+                        if let Err(e) = tx.send(initial) {
+                            error!("while sending initial value to listener: {e}");
+                        }
+                        // then wait for events:
+                        loop {
+                            tokio::select! {
+                                val = rx1.recv() => {
+                                    match val {
+                                        Ok(val) => v1 = val.clone(),
+                                        Err(e) => {
+                                            error!("error receiving value for expression listener in connection {}: {}", id, e);
+                                            break;
+                                        }
+                                    }
+                                }
+                                val = rx2.recv() => {
+                                    match val {
+                                        Ok(val) => v2 = val.clone(),
+                                        Err(e) => {
+                                            error!("error receiving value for expression listener in connection {}: {}", id, e);
+                                            break;
+                                        }
+                                    }
+                                }
+                            };
+                            if let Err(e) = tx.send(operation.clone().apply(v1.clone(), v2.clone())) {
+                                error!("error sending value for expression listener in connection {}: {}", id, e);
+                                break;
+                            }
+                        }
+                    });
+                    debug!("created joint listener for expression '{} {} {}' in connection {}", op1, operation, op2, id);
+                    rx
+                }
+            } else {
+                debug!("requested plain listener");
+                let initial = storage.get(key).clone();
+                debug!("sending initial value: {initial}");
+                let serialized = format!("{}\n", serde_json::to_string(&initial).unwrap());
+                if let Err(e) = stream.write_all(serialized.as_bytes()).await {
+                    error!("while sending initial value: {e}");
+                    return;
+                }
+                storage.listen(key.to_string()).await
+            };
+            drop(storage);
+
+            loop {
+                tokio::select! {
+                    // receive from change listener
+                    res = rx.recv() => match res {
+                        Ok(value) => {
+                            let serialized = format!("{}\n", serde_json::to_string(&value).unwrap());
+                            debug!("notifying connection {id} of change");
+                            if let Err(e) = stream.write_all(serialized.as_bytes()).await {
+                                error!("error writing response for connection {}: {}", id, e);
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            error!("while listening to events: {e}");
+                            return;
+                        }
+                    },
+                    // receive from client (for closed connections, other is ignored)
+                    s = stream.read_u8() => if let Err(e) = s {
+                        if e.kind() == ErrorKind::UnexpectedEof {
+                            warn!("peer closed connection {id}");
+                            return;
+                        }
+                    },
+                    // listen for os signals
+                    _ = signaling.recv() => {
+                        warn!("connection {id}: terminating connection");
+                        if let Err(e) = stream.shutdown().await {
+                            error!("connection {id}: while shutting down connection: {e}");
+                            return;
+                        } else {
+                            info!("connection {id}: connection closed");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            error!("unknown command '{}' received from connection {}", args[0], id);
+            return;
+        }
+    }
+
+    debug!("connection {id} transaction ended successfully");
+    warn!("closing connection {id}");
+    if let Err(e) = stream.shutdown().await {
+        error!("while shutting down connection {id}: {e}");
+    }
+    debug!("connection {id} closed")
+}
+
+async fn send(config: Config, data: Vec<String>) {
+    let Config { socket_path, .. } = config;
+    debug!("connecting to socket...");
+    let mut sock = match UnixStream::connect(&socket_path).await {
+        Ok(sock) => {
+            info!("connected to socket successfully");
+            sock
+        }
+        Err(e) => {
+            error!("could not connect to socket: {e}");
+            return;
+        },
+    };
+
+    // create SIGINT channel
+    let (tx, mut rx) = broadcast::channel(100);
+    tokio::spawn(signal_handler(tx));
+
+    debug!("writing data...");
+    match sock.write_all(data.join("\0").as_bytes()).await {
+        Ok(_) => {
+            debug!("data written successfully, wait for data/shutdown");
+            // let mut buffer = [0; 256];
+            let (sock_r, mut sock_w) = sock.split();
+            let mut reader = BufReader::new(sock_r);
+            let mut buffer = Vec::<u8>::with_capacity(1 << 10);
+
+            let mut stdout = tokio::io::stdout();
+            loop {
+                buffer.clear();
+                tokio::select! {
+                    res = reader.read_until(b'\n', &mut buffer) => match res {
+                        Ok(s) => {
+                            debug!("read {s} bytes: {:?}", &buffer[..s]);
+                            if s == 0 {
+                                info!("empty read from server, shutting down connection");
+                                if let Err(e) = sock.shutdown().await {
+                                    error!("while shutting down connection: {e}");
+                                    return;
+                                }
+                                // continue;
+                                return;
+                            }
+                            if let Err(e) = stdout.write_all(&buffer[..s]).await {
+                                error!("while writing to stdout: {e}");
+                                return;
+                            }
+                            if let Err(e) = stdout.flush().await {
+                                error!("while flushing stdout: {e}");
+                                return;
+                            }
+                        },
+                        Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                            // connection closed
+                            info!("connection closed");
+                            return;
+                        }
+                        Err(e) => {
+                            error!("while reading data from socket: {:?}", e.kind());
+                            return;
+                        },
+                    },
+                    _ = rx.recv() => {
+                        warn!("terminated.");
+                        info!("shutting down connection");
+                        if let Err(e) = sock_w.shutdown().await {
+                            error!("while shutting down connection: {e}");
+                        }
+                        return;
+                    }
+                }
+                // match reader.read_until(b'\n', &mut buffer).await
+            }
+        },
+        Err(e) => {
+            error!("while sending request: {e}");
+            return;
+        }
+    }
+}
+
+async fn signal_handler(tx: broadcast::Sender<()>) {
+    let mut sigint = signal(SignalKind::interrupt()).expect("could not setup sigint trap");
+    let mut sigterm = signal(SignalKind::terminate()).expect("could not setup sigterm trap");
+
+    if let Err(e) = tokio::select! {
+        _ = sigint.recv() => tx.send(()),
+        _ = sigterm.recv() => tx.send(()),
+    } {
+        error!("while listening for process signaling: {e}");
+    }
+}
