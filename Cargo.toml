@@ -12,3 +12,7 @@ serde_json = "1.0.140"
 toml = "0.9.8"
 tokio = { version = "1.46.0", features = ["full"] }
 directories = "6.0.0"
+
+[[bin]]
+name = "buzz"
+path = "src/main.rs"
