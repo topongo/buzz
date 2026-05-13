@@ -1,10 +1,9 @@
-use std::{collections::HashMap, fmt::Display, fs::read_to_string, io::ErrorKind, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt::Display, fs::read_to_string, io::ErrorKind, path::PathBuf, str::FromStr};
 use serde_json::{Number, Value};
-use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter}, net::{UnixListener, UnixStream}, signal::unix::{signal, SignalKind}, sync::{broadcast, Mutex}};
+use tokio::{io::{AsyncBufReadExt, AsyncWriteExt, BufReader}, net::UnixStream, sync::broadcast, task::JoinHandle};
 
 use log::{debug, error, info, warn};
 
-use clap::{Parser};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -64,6 +63,34 @@ pub struct Config {
     pub socket_path: PathBuf,
     #[allow(dead_code)]
     listeners: Option<Vec<Listener>>,
+}
+
+pub enum ConfigError {
+    NotFound,
+    ParseError(toml::de::Error),
+}
+
+impl Config {
+    pub fn from_default_path() -> Result<Self, ConfigError> {
+        let p = PathBuf::from(directories::BaseDirs::new().unwrap().config_dir()).join("buzz/config.toml");
+        Self::from_path(p)
+    }
+
+    pub fn from_path(path: PathBuf) -> Result<Self, ConfigError> {
+        if !path.exists() {
+            Err(ConfigError::NotFound)
+        } else {
+            // read to string
+            let raw = read_to_string(&path).expect("error while reading config file");
+            match toml::from_str(&raw) {
+                Ok(c) => Ok(c),
+                Err(e) => {
+                    error!("error parsing config file: {}: {e}", path.display());
+                    Err(ConfigError::ParseError(e))
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -194,3 +221,104 @@ impl Display for Operation {
     }
 }
 
+#[derive(Debug)]
+pub struct Client {
+    socket: UnixStream,
+}
+
+impl Client {
+    pub fn new(socket: UnixStream) -> Self {
+        Self { socket }
+    }
+
+    pub async fn new_from_config(config: Config) -> Result<Self, std::io::Error> {
+        UnixStream::connect(config.socket_path).await.map(|socket| Self { socket })
+    }
+
+    pub async fn write(&mut self, data: &[u8]) {
+        self.socket.write_all(data).await.expect("could not write to socket");
+    }
+
+    pub async fn send_sequence(&mut self, data: Vec<String>) {
+        self.write(data.join("\0").as_bytes()).await;
+    }
+
+    pub async fn stream(mut self) -> ClientStreamHandle {
+        let (tx_data, rx_data) = broadcast::channel(1);
+        let (tx_ctrl, mut rx_ctrl) = broadcast::channel(1);
+
+        let handle = tokio::spawn(async move {
+            let (sock_r, mut sock_w) = self.socket.split();
+            let mut reader = BufReader::new(sock_r);
+            let mut buffer = Vec::<u8>::with_capacity(1 << 10);
+
+            loop {
+                buffer.clear();
+                tokio::select! {
+                    res = reader.read_until(b'\n', &mut buffer) => match res {
+                        Ok(s) => {
+                            debug!("read {s} bytes: {:?}", &buffer[..s]);
+                            if s == 0 {
+                                info!("empty read from server, shutting down connection");
+                                if let Err(e) = self.socket.shutdown().await {
+                                    error!("while shutting down connection: {e}");
+                                    return;
+                                }
+                                // continue;
+                                return;
+                            }
+                            let decode = String::from_utf8(buffer[..s].to_vec()).expect("cannot decode data into UTF-8 from server");
+                            tx_data.send(decode).expect("could not send value to channel");
+                        },
+                        Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                            // connection closed
+                            info!("connection closed");
+                            return;
+                        }
+                        Err(e) => {
+                            error!("while reading data from socket: {:?}", e.kind());
+                            return;
+                        }
+                    },
+                    _ = rx_ctrl.recv() => {
+                        warn!("terminated.");
+                        info!("shutting down connection");
+                        if let Err(e) = sock_w.shutdown().await {
+                            error!("while shutting down connection: {e}");
+                        }
+                        return;
+                    },
+                }
+            }
+        });
+
+        ClientStreamHandle { handle, data_pipe: rx_data, control_pipe: tx_ctrl }
+    }
+}
+
+#[derive(Debug)]
+pub struct ClientStreamHandle {
+    handle: JoinHandle<()>,
+    data_pipe: broadcast::Receiver<String>,
+    control_pipe: broadcast::Sender<()>,
+}
+
+impl ClientStreamHandle {
+    pub async fn recv_raw(&mut self) -> Result<String, broadcast::error::RecvError> {
+        self.data_pipe.recv().await
+    }
+
+    pub async fn recv(&mut self) -> Result<Value, broadcast::error::RecvError> {
+        let raw = self.recv_raw().await?;
+        Ok(Value::from_str(&raw).expect("cannot deserialized data coming from server"))
+    }
+
+    pub async fn shutdown(self) {
+        if !self.handle.is_finished() {
+            if let Err(e) = self.control_pipe.send(()) {
+                error!("while sending shutdown control signal: {:?}", e)
+            }
+            self.handle.await.unwrap();
+        }
+    }
+}

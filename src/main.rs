@@ -1,7 +1,7 @@
-use std::{collections::HashMap, fmt::Display, fs::read_to_string, io::ErrorKind, path::PathBuf, sync::Arc, time::Duration};
-use buzz::{Storage, Config, Operation};
-use serde_json::{Number, Value};
-use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter}, net::{UnixListener, UnixStream}, signal::unix::{signal, SignalKind}, sync::{broadcast, Mutex}};
+use std::{io::ErrorKind, path::PathBuf, sync::Arc, time::Duration};
+use buzz::{Client, Config, ConfigError, Operation, Storage};
+use serde_json::Value;
+use tokio::{io::{AsyncReadExt, AsyncWriteExt, BufWriter}, net::UnixListener, signal::unix::{signal, SignalKind}, sync::{broadcast, Mutex}};
 
 use log::{debug, error, info, warn};
 
@@ -40,21 +40,15 @@ async fn main() {
 
     let comm = Command::parse();
 
-    let config: Config = {
-        let p = comm.config.unwrap_or(PathBuf::from(directories::BaseDirs::new().unwrap().config_dir()).join("buzz/config.toml"));
-        if !p.exists() {
-            error!("config: no such file or directory: {}", p.display());
+    let config = match Config::from_default_path() {
+        Ok(c) => c,
+        Err(ConfigError::ParseError(e)) => {
+            error!("error parsing config file: {}: {e}", p.display());
             return
         }
-
-        // read to string
-        let raw = read_to_string(&p).expect("error while reading config file");
-        match toml::from_str(&raw) {
-            Ok(c) => c,
-            Err(e) => {
-                error!("error parsing config file: {}: {e}", p.display());
-                return
-            }
+        Err(ConfigError::NotFound) => {
+            error!("config file not found");
+            return
         }
     };
 
@@ -143,24 +137,19 @@ async fn handler(id: u16, mut stream: tokio::net::UnixStream, data: Arc<Mutex<St
     debug!("handler started for connection {}", id);
     let mut output = BufWriter::new(Vec::new());
     let mut buffer = [0; 1 << 10];
-    loop {
-        match stream.read(&mut buffer).await {
-            Ok(0) => {
-                info!("connection {} closed by peer", id);
-                break;
+    match stream.read(&mut buffer).await {
+        Ok(0) => {
+            info!("connection {} closed by peer", id);
+        }
+        Ok(n) => {
+            debug!("connection {} read {} bytes: {:2x?}", id, n, &buffer[..n]);
+            if let Err(e) = output.write_all(&buffer[..n]).await {
+                error!("error writing to output for connection {}: {}", id, e);
+                return;
             }
-            Ok(n) => {
-                debug!("connection {} read {} bytes: {:2x?}", id, n, &buffer[..n]);
-                if let Err(e) = output.write_all(&buffer[..n]).await {
-                    error!("error writing to output for connection {}: {}", id, e);
-                    return;
-                }
-                break;
-            }
-            Err(e) => {
-                error!("error reading from stream for connection {}: {}", id, e);
-                break;
-            }
+        }
+        Err(e) => {
+            error!("error reading from stream for connection {}: {}", id, e);
         }
     }
 
@@ -254,7 +243,7 @@ async fn handler(id: u16, mut stream: tokio::net::UnixStream, data: Arc<Mutex<St
                     let (tx, rx) = broadcast::channel::<Value>(100);
                     tokio::spawn(async move {
                         // send initial value
-                        let initial = operation.clone().apply(v1.clone(), v2.clone());
+                        let initial = operation.apply(v1.clone(), v2.clone());
                         debug!("sending initial value: {initial}");
                         if let Err(e) = tx.send(initial) {
                             error!("while sending initial value to listener: {e}");
@@ -321,11 +310,9 @@ async fn handler(id: u16, mut stream: tokio::net::UnixStream, data: Arc<Mutex<St
                         }
                     },
                     // receive from client (for closed connections, other is ignored)
-                    s = stream.read_u8() => if let Err(e) = s {
-                        if e.kind() == ErrorKind::UnexpectedEof {
-                            warn!("peer closed connection {id}");
-                            return;
-                        }
+                    s = stream.read_u8() => if let Err(e) = s && e.kind() == ErrorKind::UnexpectedEof {
+                        warn!("peer closed connection {id}");
+                        return;
                     },
                     // listen for os signals
                     _ = signaling.recv() => {
@@ -356,12 +343,11 @@ async fn handler(id: u16, mut stream: tokio::net::UnixStream, data: Arc<Mutex<St
 }
 
 async fn send(config: Config, data: Vec<String>) {
-    let Config { socket_path, .. } = config;
     debug!("connecting to socket...");
-    let mut sock = match UnixStream::connect(&socket_path).await {
-        Ok(sock) => {
+    let mut client = match Client::new_from_config(config).await {
+        Ok(c) => {
             info!("connected to socket successfully");
-            sock
+            c
         }
         Err(e) => {
             error!("could not connect to socket: {e}");
@@ -373,65 +359,36 @@ async fn send(config: Config, data: Vec<String>) {
     let (tx, mut rx) = broadcast::channel(100);
     tokio::spawn(signal_handler(tx));
 
-    debug!("writing data...");
-    match sock.write_all(data.join("\0").as_bytes()).await {
-        Ok(_) => {
-            debug!("data written successfully, wait for data/shutdown");
-            // let mut buffer = [0; 256];
-            let (sock_r, mut sock_w) = sock.split();
-            let mut reader = BufReader::new(sock_r);
-            let mut buffer = Vec::<u8>::with_capacity(1 << 10);
+    client.send_sequence(data).await;
+    let mut handle = client.stream().await;
+    let mut stdout = tokio::io::stdout();
 
-            let mut stdout = tokio::io::stdout();
-            loop {
-                buffer.clear();
-                tokio::select! {
-                    res = reader.read_until(b'\n', &mut buffer) => match res {
-                        Ok(s) => {
-                            debug!("read {s} bytes: {:?}", &buffer[..s]);
-                            if s == 0 {
-                                info!("empty read from server, shutting down connection");
-                                if let Err(e) = sock.shutdown().await {
-                                    error!("while shutting down connection: {e}");
-                                    return;
-                                }
-                                // continue;
-                                return;
-                            }
-                            if let Err(e) = stdout.write_all(&buffer[..s]).await {
-                                error!("while writing to stdout: {e}");
-                                return;
-                            }
-                            if let Err(e) = stdout.flush().await {
-                                error!("while flushing stdout: {e}");
-                                return;
-                            }
-                        },
-                        Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                            // connection closed
-                            info!("connection closed");
-                            return;
-                        }
-                        Err(e) => {
-                            error!("while reading data from socket: {:?}", e.kind());
-                            return;
-                        },
-                    },
-                    _ = rx.recv() => {
-                        warn!("terminated.");
-                        info!("shutting down connection");
-                        if let Err(e) = sock_w.shutdown().await {
-                            error!("while shutting down connection: {e}");
-                        }
+    loop {
+        tokio::select! {
+            v = handle.recv_raw() => match v {
+                Ok(v) => {
+                    if let Err(e) = stdout.write_all(v.as_bytes()).await {
+                        error!("while writing to stdout: {e}");
                         return;
                     }
-                }
-                // match reader.read_until(b'\n', &mut buffer).await
+                    if let Err(e) = stdout.flush().await {
+                        error!("while flushing stdout: {e}");
+                        return;
+                    }
+                },
+                Err(e) => {
+                    if matches!(e, broadcast::error::RecvError::Closed) {
+                        handle.shutdown().await;
+                        return;
+                    } else {
+                        error!("while receiving from data socket: {:?}", e);
+                    }
+                },
+            },
+            _ = rx.recv() => {
+                handle.shutdown().await;
+                return;
             }
-        },
-        Err(e) => {
-            error!("while sending request: {e}");
-            return;
         }
     }
 }
